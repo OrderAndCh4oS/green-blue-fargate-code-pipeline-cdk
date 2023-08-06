@@ -1,14 +1,21 @@
-# Welcome to your CDK TypeScript project
+# GreenBlueFargateCodePipelineCdkStack
 
-This is a blank project for CDK development with TypeScript.
+The `GreenBlueFargateCodePipelineCdkStack` is an AWS CloudFormation stack implemented using the AWS Cloud Development Kit (CDK). It sets up a Blue-Green deployment pipeline for a Fargate-based application on Amazon ECS (Elastic Container Service). This allows seamless deployment and rollback between two separate environments (Blue and Green) to minimize downtime and ensure smooth updates.
 
-The `cdk.json` file tells the CDK Toolkit how to execute your app.
+## Stack Overview
 
-## Useful commands
+The stack consists of the following components:
 
-* `npm run build`   compile typescript to js
-* `npm run watch`   watch for changes and compile
-* `npm run test`    perform the jest unit tests
-* `cdk deploy`      deploy this stack to your default AWS account/region
-* `cdk diff`        compare deployed stack with current state
-* `cdk synth`       emits the synthesized CloudFormation template
+1. Amazon ECS Cluster and Task Definition: Sets up an ECS cluster and defines a Fargate task with a Docker container that runs the application.
+
+2. Amazon Application Load Balancer (ALB): Creates an ALB that distributes traffic between the Blue and Green environments.
+
+3. CodePipeline: Creates a CI/CD pipeline using AWS CodePipeline to automate the application deployment process.
+
+4. CodeBuild Project: Configures a CodeBuild project to build the Docker image of the application and push it to Amazon ECR (Elastic Container Registry).
+
+5. Amazon ECR Repository: Sets up a repository to store the Docker images built by the CodeBuild project.
+
+6. CodeDeploy: Configures an AWS CodeDeploy deployment group for Blue-Green deployment using ECS services.
+
+7. AWS Systems Manager Parameter Store: Stores parameter values, such as the hosted zone ID and domain name, used in the deployment process.
