@@ -22,7 +22,6 @@ import {BuildSpec, LinuxBuildImage, PipelineProject} from "aws-cdk-lib/aws-codeb
 import {CodeBuildAction, CodeDeployEcsDeployAction, GitHubSourceAction} from "aws-cdk-lib/aws-codepipeline-actions";
 import {IRepository, Repository} from "aws-cdk-lib/aws-ecr";
 import {EcsApplication, EcsDeploymentConfig, EcsDeploymentGroup} from "aws-cdk-lib/aws-codedeploy";
-import tidyYml from '@orderandchaos/tidy-yml';
 
 export type CdkStackProps = {
     certificateDomainNameParameterName: string;
@@ -142,7 +141,7 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
             targets: [fargate],
         });
 
-        const testListener = alb.addListener(`api-blue-green-test-listener`, {port: 80, open: true});
+        const testListener = alb.addListener(`api-blue-green-test-listener`, {port: 8080, open: true});
 
         const greenTargetGroup = testListener.addTargets(`api-blue-green-target-80`, {
             targetGroupName: `green-target-group`,
@@ -207,18 +206,7 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
             ]
         }
 
-        const appspec = tidyYml`
-            version: 0.0
-            Resources:
-              - TargetService:
-                  Type: AWS::ECS::Service
-                  Properties:
-                    TaskDefinition: "${taskDefinition.taskDefinitionArn}"
-                    LoadBalancerInfo:
-                      ContainerName: "sample-app"
-                      ContainerPort: 80
-                    PlatformVersion: "LATEST"
-        `
+        const appspec = `version: 0.0\nResources:\n  - TargetService:\n      Type: AWS::ECS::Service\n      Properties:\n        TaskDefinition: "${taskDefinition.taskDefinitionArn}"\n        LoadBalancerInfo:\n          ContainerName: "api-blue-green-container"\n          ContainerPort: 80\n        PlatformVersion: "LATEST"\n`
 
         const buildProject = new PipelineProject(this, 'ApiDeploymentBuildProject', {
             buildSpec: BuildSpec.fromObject({
@@ -238,9 +226,9 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
                     post_build: {
                         commands: [
                             `docker push ${ecrRepository.repositoryUri}:latest`,
-                            `echo Container image to be used ${ecrRepository.repositoryUri}:$IMAGE_TAG`,
-                            `echo ${taskdef} > taskdef.json`,
-                            `echo ${appspec} > appspec.yaml`,
+                            `echo Container image to be used ${ecrRepository.repositoryUri}:latest`,
+                            `echo '${JSON.stringify(taskdef)}' > taskdef.json`,
+                            `echo "${appspec}" > appspec.yaml`,
                             "cat taskdef.json",
                             "cat appspec.yaml",
                         ],
@@ -308,8 +296,8 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
                 new CodeDeployEcsDeployAction({
                     actionName: 'Deploy',
                     deploymentGroup: ecsDeploymentGp,
-                    taskDefinitionTemplateInput: buildStageOutput,
-                    appSpecTemplateInput: buildStageOutput,
+                    taskDefinitionTemplateFile: buildStageOutput.atPath('taskdef.json'),
+                    appSpecTemplateFile: buildStageOutput.atPath('appspec.yaml'),
                 })
             ]
         })
