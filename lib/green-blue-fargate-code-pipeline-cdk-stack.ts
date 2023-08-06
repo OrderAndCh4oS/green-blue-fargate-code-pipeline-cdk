@@ -1,19 +1,28 @@
-import {SecretValue, Stack, StackProps} from 'aws-cdk-lib';
-import {Certificate, CertificateValidation} from 'aws-cdk-lib/aws-certificatemanager';
+import {Duration, RemovalPolicy, SecretValue, Stack, StackProps} from 'aws-cdk-lib';
 import {Construct} from 'constructs';
-import {SubnetType, Vpc} from "aws-cdk-lib/aws-ec2";
+import {SecurityGroup, Vpc} from "aws-cdk-lib/aws-ec2";
 import {StringParameter} from "aws-cdk-lib/aws-ssm";
 import {ARecord, HostedZone, RecordTarget} from "aws-cdk-lib/aws-route53";
-import {Cluster, ContainerImage, DeploymentControllerType, LogDrivers} from "aws-cdk-lib/aws-ecs";
-import {Effect, PolicyStatement, Role} from "aws-cdk-lib/aws-iam";
-import {ApplicationLoadBalancedFargateService} from "aws-cdk-lib/aws-ecs-patterns";
-import {RetentionDays} from "aws-cdk-lib/aws-logs";
-import {ApplicationProtocol} from "aws-cdk-lib/aws-elasticloadbalancingv2";
+import {
+    AppProtocol,
+    AwsLogDriver,
+    Cluster,
+    ContainerImage,
+    DeploymentControllerType,
+    FargateService,
+    FargateTaskDefinition,
+    Protocol
+} from "aws-cdk-lib/aws-ecs";
+import {Effect, ManagedPolicy, PolicyStatement, Role, ServicePrincipal} from "aws-cdk-lib/aws-iam";
+import {LogGroup} from "aws-cdk-lib/aws-logs";
+import {ApplicationLoadBalancer, ApplicationProtocol} from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import {LoadBalancerTarget} from "aws-cdk-lib/aws-route53-targets";
 import {Artifact, Pipeline} from "aws-cdk-lib/aws-codepipeline";
 import {BuildSpec, LinuxBuildImage, PipelineProject} from "aws-cdk-lib/aws-codebuild";
-import {CodeBuildAction, EcsDeployAction, GitHubSourceAction} from "aws-cdk-lib/aws-codepipeline-actions";
+import {CodeBuildAction, CodeDeployEcsDeployAction, GitHubSourceAction} from "aws-cdk-lib/aws-codepipeline-actions";
 import {IRepository, Repository} from "aws-cdk-lib/aws-ecr";
+import {EcsApplication, EcsDeploymentConfig, EcsDeploymentGroup} from "aws-cdk-lib/aws-codedeploy";
+import tidyYml from '@orderandchaos/tidy-yml';
 
 export type CdkStackProps = {
     certificateDomainNameParameterName: string;
@@ -26,13 +35,13 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
     constructor(scope: Construct, id: string, props: CdkStackProps) {
         super(scope, id, props);
 
-        const certificateDomainName = StringParameter.fromStringParameterName(this, 'CertificateDomainName', props.certificateDomainNameParameterName);
+        // const certificateDomainName = StringParameter.fromStringParameterName(this, 'CertificateDomainName', props.certificateDomainNameParameterName);
         const hostedZoneId = StringParameter.fromStringParameterName(this, 'HostedZoneId', props.hostedZoneIdParameterName);
         const hostedZoneName = StringParameter.fromStringParameterName(this, 'HostedZoneName', props.hostedZoneNameParameterName);
         const aRecordName = StringParameter.fromStringParameterName(this, 'ARecordName', props.aRecordNameParameterName);
 
         const ecrRepository: IRepository = new Repository(this, "ApiECRRepository", {
-            repositoryName: "api-code-pipeline-images", // Replace with your desired repository name
+            repositoryName: "api-code-pipeline-bg-images",
         });
 
         const ecrPolicyStatement = new PolicyStatement({
@@ -52,46 +61,94 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
             }
         );
 
-        const certificate = new Certificate(this, "ApiHttpsFargateAlbCertificate", {
-            domainName: certificateDomainName.stringValue,
-            validation: CertificateValidation.fromDns(publicZone),
-        });
-
-
-        const vpc = new Vpc(this, "ApiVpc", {
-            natGateways: 1,
-            subnetConfiguration: [
-                {cidrMask: 24, subnetType: SubnetType.PUBLIC, name: "Public"},
-                {cidrMask: 24, subnetType: SubnetType.PRIVATE_WITH_EGRESS, name: "Private"}
-            ],
-            maxAzs: 3
-        });
-
-        const cluster = new Cluster(this, 'ApiCluster', {
-            vpc,
-            containerInsights: true
-        });
+        // const certificate = new Certificate(this, "ApiHttpsFargateAlbCertificate", {
+        //     domainName: certificateDomainName.stringValue,
+        //     validation: CertificateValidation.fromDns(publicZone),
+        // });
 
         const image = ContainerImage.fromEcrRepository(ecrRepository, "latest");
 
-        const fargate = new ApplicationLoadBalancedFargateService(this, 'ApiAlbFargate', {
-            cluster,
-            taskImageOptions: {
-                image,
-                containerPort: 80,
-                logDriver: LogDrivers.awsLogs({
-                    streamPrefix: id,
-                    logRetention: RetentionDays.ONE_MONTH,
-                }),
-            },
-            assignPublicIp: true,
-            memoryLimitMiB: 512,
+        const ecsRole = new Role(this, `EcsRole`, {
+            assumedBy: new ServicePrincipal('ecs-tasks.amazonaws.com'),
+            managedPolicies: [ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy')],
+        });
+
+        const vpc = new Vpc(this, `api-blue-green-vpc`, {
+            natGateways: 1,
+            maxAzs: 2,
+        });
+
+        const alb = new ApplicationLoadBalancer(this, `api-blue-green-alb`, {
+            loadBalancerName: 'ecs-fargate-blue-green',
+            vpc,
+            internetFacing: true,
+        });
+
+        const ecs = new Cluster(this, `api-blue-green-cluster`, {
+            vpc,
+        });
+
+        const taskDefinition = new FargateTaskDefinition(this, `api-blue-green-fargate-task-definition`, {
+            executionRole: ecsRole,
+            taskRole: ecsRole,
             cpu: 256,
+            memoryLimitMiB: 512,
+        });
+        taskDefinition.addContainer(`api-blue-green-container`, {
+            image,
+            portMappings: [
+                {
+                    containerPort: 80,
+                    protocol: Protocol.TCP,
+                    name: 'ecs-container-80-tcp',
+                    appProtocol: AppProtocol.http
+                },
+            ],
+            memoryLimitMiB: 512,
+            logging: new AwsLogDriver({
+                logGroup: new LogGroup(this, `api-blue-green-fargate-task-definition-log-group`, {
+                    logGroupName: `/ecs/api-blue-green-fargate-task-definition-log-group`,
+                    removalPolicy: RemovalPolicy.DESTROY
+                }),
+                streamPrefix: 'ApiDeployBlueGreenLogStream'
+            })
+        });
+
+        const fargateSg = new SecurityGroup(this, `api-blue-green-fargate-sg`, {
+            securityGroupName: `api-blue-green-fargate`,
+            vpc,
+        });
+
+        const fargate = new FargateService(this, `api-blue-green-fargate-service`, {
+            serviceName: `api-blue-green-fargate-svc`,
+            taskDefinition,
             desiredCount: 1,
-            deploymentController: {type: DeploymentControllerType.ECS},
-            protocol: ApplicationProtocol.HTTPS,
-            certificate,
-            redirectHTTP: true,
+            cluster: ecs,
+            securityGroups: [fargateSg],
+            deploymentController: {
+                type: DeploymentControllerType.CODE_DEPLOY
+            },
+            capacityProviderStrategies: [
+                {capacityProvider: 'FARGATE_SPOT', weight: 1}
+            ]
+        });
+
+        const listener = alb.addListener(`api-blue-green-prod-listener`, {port: 80, open: true});
+
+        const blueTargetGroup = listener.addTargets(`api-blue-green-blue-target-group`, {
+            targetGroupName: `blue-target-group`,
+            protocol: ApplicationProtocol.HTTP,
+            healthCheck: {path: '/', interval: Duration.seconds(30),},
+            targets: [fargate],
+        });
+
+        const testListener = alb.addListener(`api-blue-green-test-listener`, {port: 80, open: true});
+
+        const greenTargetGroup = testListener.addTargets(`api-blue-green-target-80`, {
+            targetGroupName: `green-target-group`,
+            protocol: ApplicationProtocol.HTTP,
+            healthCheck: {path: '/', interval: Duration.seconds(30),},
+            targets: [fargate],
         });
 
         fargate.taskDefinition.addToExecutionRolePolicy(ecrPolicyStatement);
@@ -100,7 +157,7 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
             zone: publicZone,
             recordName: aRecordName.stringValue,
             target: RecordTarget.fromAlias(
-                new LoadBalancerTarget(fargate.loadBalancer)
+                new LoadBalancerTarget(alb)
             ),
         });
 
@@ -119,6 +176,50 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
             ],
         });
 
+        const taskdef = {
+            family: "api-blue-green-fargate-task-definition",
+            executionRoleArn: ecsRole.roleArn,
+            taskRoleArn: ecsRole.roleArn,
+            containerDefinitions: [
+                {
+                    name: "api-blue-green-container",
+                    image: ecrRepository.repositoryUri,
+                    cpu: 256,
+                    memory: 512,
+                    essential: true,
+                    portMappings: [
+                        {
+                            containerPort: 80,
+                            protocol: "tcp",
+                            name: "ecs-container-80-tcp",
+                            appProtocol: "http"
+                        }
+                    ],
+                    logConfiguration: {
+                        logDriver: "awslogs",
+                        options: {
+                            "awslogs-group": "/ecs/api-blue-green-fargate-task-definition-log-group",
+                            "awslogs-stream-prefix": "ApiDeployBlueGreenLogStream",
+                            "awslogs-region": "eu-west-1"
+                        }
+                    }
+                }
+            ]
+        }
+
+        const appspec = tidyYml`
+            version: 0.0
+            Resources:
+              - TargetService:
+                  Type: AWS::ECS::Service
+                  Properties:
+                    TaskDefinition: "${taskDefinition.taskDefinitionArn}"
+                    LoadBalancerInfo:
+                      ContainerName: "sample-app"
+                      ContainerPort: 80
+                    PlatformVersion: "LATEST"
+        `
+
         const buildProject = new PipelineProject(this, 'ApiDeploymentBuildProject', {
             buildSpec: BuildSpec.fromObject({
                 version: '0.2',
@@ -132,18 +233,24 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
                     build: {
                         commands: [
                             `docker build -t ${ecrRepository.repositoryUri}:latest .`,
-                            `docker push ${ecrRepository.repositoryUri}:latest`,
                         ],
                     },
                     post_build: {
                         commands: [
-                            // Prepare the image definitions artifact file
-                            `echo '[{"name":"web","imageUri":"${ecrRepository.repositoryUri}:latest"}]' > imagedefinitions.json`,
+                            `docker push ${ecrRepository.repositoryUri}:latest`,
+                            `echo Container image to be used ${ecrRepository.repositoryUri}:$IMAGE_TAG`,
+                            `echo ${taskdef} > taskdef.json`,
+                            `echo ${appspec} > appspec.yaml`,
+                            "cat taskdef.json",
+                            "cat appspec.yaml",
                         ],
                     },
                 },
                 artifacts: {
-                    files: ['imagedefinitions.json'],
+                    files: [
+                        "appspec.yaml",
+                        "taskdef.json"
+                    ],
                 },
             }),
             environment: {
@@ -182,15 +289,30 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
             })
         );
 
-        const deployStage = pipeline.addStage({stageName: 'Deploy'});
-        deployStage.addAction(
-            new EcsDeployAction({
-                actionName: 'DeployAction',
-                service: fargate.service,
-                input: buildStageOutput
-                // imageFile: buildStageOutput.atPath('imagedefinitions.json'),
-            })
-        );
+        const ecsDeploymentGp = new EcsDeploymentGroup(this, `ApiBlueGreenEcsDeploymentGroup`, {
+            deploymentGroupName: 'ApiBlueGreen',
+            deploymentConfig: EcsDeploymentConfig.LINEAR_10PERCENT_EVERY_1MINUTES,
+            application: new EcsApplication(this, `ecs-application`),
+            service: fargate,
+            blueGreenDeploymentConfig: {
+                blueTargetGroup,
+                greenTargetGroup,
+                listener,
+                testListener,
+            },
+        });
+
+        pipeline.addStage({
+            stageName: 'Deploy',
+            actions: [
+                new CodeDeployEcsDeployAction({
+                    actionName: 'Deploy',
+                    deploymentGroup: ecsDeploymentGp,
+                    taskDefinitionTemplateInput: buildStageOutput,
+                    appSpecTemplateInput: buildStageOutput,
+                })
+            ]
+        })
 
         const buildProjectRole = buildProject.role as Role;
         buildProjectRole.addToPolicy(ecrPolicyStatement);
