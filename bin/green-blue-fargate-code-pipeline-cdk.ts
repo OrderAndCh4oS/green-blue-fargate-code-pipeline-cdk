@@ -6,7 +6,9 @@ import { GreenBlueFargateCodePipelineCdkStack } from '../lib/green-blue-fargate-
 const app = new cdk.App();
 new GreenBlueFargateCodePipelineCdkStack(app, 'GreenBlueFargateCodePipelineCdkStack', {
     certificateDomainNameParameterName: '/api/certificateDomainName',
+    testCertificateDomainNameParameterName: '/api/testCertificateDomainName',
     hostedZoneIdParameterName: '/api/hostedZoneId',
     hostedZoneNameParameterName: '/api/hostedZoneName',
     aRecordNameParameterName: '/api/aRecordName',
+    testARecordNameParameterName: '/api/testARecordName',
 });

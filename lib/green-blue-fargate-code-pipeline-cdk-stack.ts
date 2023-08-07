@@ -22,25 +22,30 @@ import {BuildSpec, LinuxBuildImage, PipelineProject} from "aws-cdk-lib/aws-codeb
 import {CodeBuildAction, CodeDeployEcsDeployAction, GitHubSourceAction} from "aws-cdk-lib/aws-codepipeline-actions";
 import {IRepository, Repository} from "aws-cdk-lib/aws-ecr";
 import {EcsApplication, EcsDeploymentConfig, EcsDeploymentGroup} from "aws-cdk-lib/aws-codedeploy";
+import {Certificate, CertificateValidation} from 'aws-cdk-lib/aws-certificatemanager';
 
 export type CdkStackProps = {
     certificateDomainNameParameterName: string;
+    testCertificateDomainNameParameterName: string;
     hostedZoneIdParameterName: string;
     hostedZoneNameParameterName: string;
     aRecordNameParameterName: string;
+    testARecordNameParameterName: string;
 } & StackProps;
 
 export class GreenBlueFargateCodePipelineCdkStack extends Stack {
     constructor(scope: Construct, id: string, props: CdkStackProps) {
         super(scope, id, props);
 
-        // const certificateDomainName = StringParameter.fromStringParameterName(this, 'CertificateDomainName', props.certificateDomainNameParameterName);
+        const certificateDomainName = StringParameter.fromStringParameterName(this, 'CertificateDomainName', props.certificateDomainNameParameterName);
+        // const testCertificateDomainName = StringParameter.fromStringParameterName(this, 'TestCertificateDomainName', props.certificateDomainNameParameterName);
         const hostedZoneId = StringParameter.fromStringParameterName(this, 'HostedZoneId', props.hostedZoneIdParameterName);
         const hostedZoneName = StringParameter.fromStringParameterName(this, 'HostedZoneName', props.hostedZoneNameParameterName);
         const aRecordName = StringParameter.fromStringParameterName(this, 'ARecordName', props.aRecordNameParameterName);
+        // const testARecordName = StringParameter.fromStringParameterName(this, 'TestARecordName', props.aRecordNameParameterName);
 
         const ecrRepository: IRepository = new Repository(this, "ApiECRRepository", {
-            repositoryName: "api-code-pipeline-bg-images",
+            repositoryName: "api-code-pipeline-bg-images"
         });
 
         const ecrPolicyStatement = new PolicyStatement({
@@ -60,10 +65,10 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
             }
         );
 
-        // const certificate = new Certificate(this, "ApiHttpsFargateAlbCertificate", {
-        //     domainName: certificateDomainName.stringValue,
-        //     validation: CertificateValidation.fromDns(publicZone),
-        // });
+        const blueCertificate = new Certificate(this, 'BlueCertificate', {
+            domainName: certificateDomainName.stringValue, // Use the same domain as mainCertificate
+            validation: CertificateValidation.fromDns(publicZone),
+        });
 
         const image = ContainerImage.fromEcrRepository(ecrRepository, "latest");
 
@@ -119,7 +124,7 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
         });
 
         const fargate = new FargateService(this, `api-blue-green-fargate-service`, {
-            serviceName: `api-blue-green-fargate-svc`,
+            serviceName: `api-blue-green-fargate-service`,
             taskDefinition,
             desiredCount: 1,
             cluster: ecs,
@@ -132,7 +137,16 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
             ]
         });
 
-        const listener = alb.addListener(`api-blue-green-prod-listener`, {port: 80, open: true});
+        const listener = alb.addListener(`api-blue-green-prod-listener`, {
+            port: 443,
+            certificates: [blueCertificate],
+            open: true,
+        });
+
+        const testListener = alb.addListener(`api-blue-green-test-listener`, {
+            port: 8080,
+            open: true,
+        });
 
         const blueTargetGroup = listener.addTargets(`api-blue-green-blue-target-group`, {
             targetGroupName: `blue-target-group`,
@@ -140,8 +154,6 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
             healthCheck: {path: '/', interval: Duration.seconds(30),},
             targets: [fargate],
         });
-
-        const testListener = alb.addListener(`api-blue-green-test-listener`, {port: 8080, open: true});
 
         const greenTargetGroup = testListener.addTargets(`api-blue-green-target-80`, {
             targetGroupName: `green-target-group`,
@@ -206,7 +218,24 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
             ]
         }
 
-        const appspec = `version: 0.0\nResources:\n  - TargetService:\n      Type: AWS::ECS::Service\n      Properties:\n        TaskDefinition: "${taskDefinition.taskDefinitionArn}"\n        LoadBalancerInfo:\n          ContainerName: "api-blue-green-container"\n          ContainerPort: 80\n        PlatformVersion: "LATEST"\n`
+        const appspec = {
+            version: "0.0",
+            Resources: [
+                {
+                    TargetService: {
+                        Type: "AWS::ECS::Service",
+                        Properties: {
+                            TaskDefinition: taskDefinition.taskDefinitionArn,
+                            LoadBalancerInfo: {
+                                ContainerName: "api-blue-green-container",
+                                ContainerPort: 80
+                            },
+                            PlatformVersion: "LATEST"
+                        }
+                    }
+                }
+            ]
+        }
 
         const buildProject = new PipelineProject(this, 'ApiDeploymentBuildProject', {
             buildSpec: BuildSpec.fromObject({
@@ -228,15 +257,15 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
                             `docker push ${ecrRepository.repositoryUri}:latest`,
                             `echo Container image to be used ${ecrRepository.repositoryUri}:latest`,
                             `echo '${JSON.stringify(taskdef)}' > taskdef.json`,
-                            `echo "${appspec}" > appspec.yaml`,
+                            `echo '${JSON.stringify(appspec)}' > appspec.json`,
                             "cat taskdef.json",
-                            "cat appspec.yaml",
+                            "cat appspec.json",
                         ],
                     },
                 },
                 artifacts: {
                     files: [
-                        "appspec.yaml",
+                        "appspec.json",
                         "taskdef.json"
                     ],
                 },
@@ -297,7 +326,7 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
                     actionName: 'Deploy',
                     deploymentGroup: ecsDeploymentGp,
                     taskDefinitionTemplateFile: buildStageOutput.atPath('taskdef.json'),
-                    appSpecTemplateFile: buildStageOutput.atPath('appspec.yaml'),
+                    appSpecTemplateFile: buildStageOutput.atPath('appspec.json'),
                 })
             ]
         })
