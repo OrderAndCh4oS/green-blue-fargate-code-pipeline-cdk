@@ -85,6 +85,7 @@ This project uses AWS CDK to define the infrastructure as code. It includes the 
 
 - Parameterise repo values
 - Pull build script in from other repo
+- Add ssl certificate to test port/url
 
 ## Contributing
 
