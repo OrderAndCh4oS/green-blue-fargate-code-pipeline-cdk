@@ -1,185 +1,46 @@
-import {Duration, RemovalPolicy, SecretValue, Stack, StackProps} from 'aws-cdk-lib';
+import {SecretValue, Stack} from 'aws-cdk-lib';
 import {Construct} from 'constructs';
-import {SecurityGroup, Vpc} from "aws-cdk-lib/aws-ec2";
-import {StringParameter} from "aws-cdk-lib/aws-ssm";
-import {ARecord, HostedZone, RecordTarget} from "aws-cdk-lib/aws-route53";
-import {
-    AppProtocol,
-    AwsLogDriver,
-    Cluster,
-    ContainerImage,
-    DeploymentControllerType,
-    FargateService,
-    FargateTaskDefinition,
-    Protocol
-} from "aws-cdk-lib/aws-ecs";
-import {Effect, ManagedPolicy, PolicyStatement, Role, ServicePrincipal} from "aws-cdk-lib/aws-iam";
-import {LogGroup} from "aws-cdk-lib/aws-logs";
-import {ApplicationLoadBalancer, ApplicationProtocol} from "aws-cdk-lib/aws-elasticloadbalancingv2";
-import {LoadBalancerTarget} from "aws-cdk-lib/aws-route53-targets";
+import {Effect, PolicyStatement, Role} from "aws-cdk-lib/aws-iam";
 import {Artifact, Pipeline} from "aws-cdk-lib/aws-codepipeline";
 import {BuildSpec, LinuxBuildImage, PipelineProject} from "aws-cdk-lib/aws-codebuild";
 import {CodeBuildAction, CodeDeployEcsDeployAction, GitHubSourceAction} from "aws-cdk-lib/aws-codepipeline-actions";
-import {IRepository, Repository} from "aws-cdk-lib/aws-ecr";
 import {EcsApplication, EcsDeploymentConfig, EcsDeploymentGroup} from "aws-cdk-lib/aws-codedeploy";
-import {Certificate, CertificateValidation} from 'aws-cdk-lib/aws-certificatemanager';
-
-export type CdkStackProps = {
-    certificateDomainNameParameterName: string;
-    testCertificateDomainNameParameterName: string;
-    hostedZoneIdParameterName: string;
-    hostedZoneNameParameterName: string;
-    aRecordNameParameterName: string;
-    testARecordNameParameterName: string;
-} & StackProps;
+import {CommonStackProps} from "../bin/green-blue-fargate-code-pipeline-cdk";
+import {StringParameter} from "aws-cdk-lib/aws-ssm";
+import {ApplicationListener, ApplicationTargetGroup} from "aws-cdk-lib/aws-elasticloadbalancingv2";
+import {Repository} from "aws-cdk-lib/aws-ecr";
+import {Cluster, FargateService} from "aws-cdk-lib/aws-ecs";
+import {SecurityGroup} from "aws-cdk-lib/aws-ec2";
 
 export class GreenBlueFargateCodePipelineCdkStack extends Stack {
-    constructor(scope: Construct, id: string, props: CdkStackProps) {
+    constructor(scope: Construct, id: string, props: { repositoryName: string } & CommonStackProps) {
         super(scope, id, props);
 
-        const certificateDomainName = StringParameter.fromStringParameterName(this, 'CertificateDomainName', props.certificateDomainNameParameterName);
-        // const testCertificateDomainName = StringParameter.fromStringParameterName(this, 'TestCertificateDomainName', props.certificateDomainNameParameterName);
-        const hostedZoneId = StringParameter.fromStringParameterName(this, 'HostedZoneId', props.hostedZoneIdParameterName);
-        const hostedZoneName = StringParameter.fromStringParameterName(this, 'HostedZoneName', props.hostedZoneNameParameterName);
-        const aRecordName = StringParameter.fromStringParameterName(this, 'ARecordName', props.aRecordNameParameterName);
-        // const testARecordName = StringParameter.fromStringParameterName(this, 'TestARecordName', props.aRecordNameParameterName);
-
-        const ecrRepository: IRepository = new Repository(this, "ApiECRRepository", {
-            repositoryName: "api-code-pipeline-bg-images"
-        });
-
-        const ecrPolicyStatement = new PolicyStatement({
-            effect: Effect.ALLOW,
-            actions: [
-                'ecr:*', // Todo: figure out what permissions are actually required
-            ],
-            resources: ['*'],
-        });
-
-        const publicZone = HostedZone.fromHostedZoneAttributes(
-            this,
-            "HttpsFargateAlbPublicZone",
-            {
-                zoneName: hostedZoneName.stringValue,
-                hostedZoneId: hostedZoneId.stringValue,
-            }
-        );
-
-        const blueCertificate = new Certificate(this, 'BlueCertificate', {
-            domainName: certificateDomainName.stringValue, // Use the same domain as mainCertificate
-            validation: CertificateValidation.fromDns(publicZone),
-        });
-
-        const image = ContainerImage.fromEcrRepository(ecrRepository, "latest");
-
-        const ecsRole = new Role(this, `EcsRole`, {
-            assumedBy: new ServicePrincipal('ecs-tasks.amazonaws.com'),
-            managedPolicies: [ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy')],
-        });
-
-        const vpc = new Vpc(this, `api-blue-green-vpc`, {
-            natGateways: 1,
-            maxAzs: 2,
-        });
-
-        const alb = new ApplicationLoadBalancer(this, `api-blue-green-alb`, {
-            loadBalancerName: 'ecs-fargate-blue-green',
-            vpc,
-            internetFacing: true,
-        });
-
-        const ecs = new Cluster(this, `api-blue-green-cluster`, {
-            vpc,
-        });
-
-        const taskDefinition = new FargateTaskDefinition(this, `api-blue-green-fargate-task-definition`, {
-            executionRole: ecsRole,
-            taskRole: ecsRole,
-            cpu: 256,
-            memoryLimitMiB: 512,
-        });
-        taskDefinition.addContainer(`api-blue-green-container`, {
-            image,
-            portMappings: [
-                {
-                    containerPort: 80,
-                    protocol: Protocol.TCP,
-                    name: 'ecs-container-80-tcp',
-                    appProtocol: AppProtocol.http
-                },
-            ],
-            memoryLimitMiB: 512,
-            logging: new AwsLogDriver({
-                logGroup: new LogGroup(this, `api-blue-green-fargate-task-definition-log-group`, {
-                    logGroupName: `/ecs/api-blue-green-fargate-task-definition-log-group`,
-                    removalPolicy: RemovalPolicy.DESTROY
-                }),
-                streamPrefix: 'ApiDeployBlueGreenLogStream'
-            })
-        });
-
-        const fargateSg = new SecurityGroup(this, `api-blue-green-fargate-sg`, {
-            securityGroupName: `api-blue-green-fargate`,
-            vpc,
-        });
-
-        const fargate = new FargateService(this, `api-blue-green-fargate-service`, {
-            serviceName: `api-blue-green-fargate-service`,
-            taskDefinition,
-            desiredCount: 1,
-            cluster: ecs,
-            securityGroups: [fargateSg],
-            deploymentController: {
-                type: DeploymentControllerType.CODE_DEPLOY
-            },
-            capacityProviderStrategies: [
-                {capacityProvider: 'FARGATE_SPOT', weight: 1}
-            ]
-        });
-
-        const listener = alb.addListener(`api-blue-green-prod-listener`, {
-            port: 443,
-            certificates: [blueCertificate],
-            open: true,
-        });
-
-        const testListener = alb.addListener(`api-blue-green-test-listener`, {
-            port: 8080,
-            open: true,
-        });
-
-        const blueTargetGroup = listener.addTargets(`api-blue-green-blue-target-group`, {
-            targetGroupName: `blue-target-group`,
-            protocol: ApplicationProtocol.HTTP,
-            healthCheck: {path: '/', interval: Duration.seconds(30),},
-            targets: [fargate],
-        });
-
-        const greenTargetGroup = testListener.addTargets(`api-blue-green-target-80`, {
-            targetGroupName: `green-target-group`,
-            protocol: ApplicationProtocol.HTTP,
-            healthCheck: {path: '/', interval: Duration.seconds(30),},
-            targets: [fargate],
-        });
-
-        fargate.taskDefinition.addToExecutionRolePolicy(ecrPolicyStatement);
-
-        new ARecord(this, "ApiHttpsFargateAlbARecord", {
-            zone: publicZone,
-            recordName: aRecordName.stringValue,
-            target: RecordTarget.fromAlias(
-                new LoadBalancerTarget(alb)
-            ),
-        });
-
-        // +++++++++++++++++++++++++++++++++++++
+        const fargateServiceParameter = StringParameter.fromStringParameterName(this, 'FargateServiceParameter', props.parameterNames.fargateServiceArn);
+        const albSecurityGroupId = StringParameter.fromStringParameterName(this, 'AlbSecurityGroupId', props.parameterNames.albSecurityGroupId);
+        const taskDefinitionParameter = StringParameter.fromStringParameterName(this, 'TaskDefinitionParameter', props.parameterNames.taskDefinitionArn);
+        const ecsRoleArnParameter = StringParameter.fromStringParameterName(this, 'EcrPolicyStatementParameter', props.parameterNames.ecsRoleArn);
+        const ecsArnParameter = StringParameter.fromStringParameterName(this, 'EcsParameter', props.parameterNames.ecsArn);
+        const blueTargetGroupArnParameter = StringParameter.fromStringParameterName(this, 'BlueTargetGroupArnParameter', props.parameterNames.blueTargetGroupArn);
+        const greenTargetGroupArnParameter = StringParameter.fromStringParameterName(this, 'GreenTargetGroupArnParameter', props.parameterNames.greenTargetGroupArn);
+        const listenerArnParameter = StringParameter.fromStringParameterName(this, 'ListenerArnParameter', props.parameterNames.listenerArn);
+        const testListenerArnParameter = StringParameter.fromStringParameterName(this, 'TestListenerArnParameter', props.parameterNames.testListenerArn);
 
         // Todo: make these variables or aws params with the names as variables
         const repositoryOwner = 'OrderAndCh4oS';
         const repositoryName = 'python-fastapi-docker';
         const branchName = 'main';
 
-        // Create the IAM policy statement
+        const ecrRepository = Repository.fromRepositoryName(this, 'GreenBlueEcrRepository', props.repositoryName)
+
+        const ecrPolicyStatement = new PolicyStatement({
+            effect: Effect.ALLOW,
+            actions: [
+                'ecr:*', // Todo: figure out what permissions are actually required
+            ],
+            resources: ['*'], // Todo: try setting ecrRepositoryArn as resource
+        });
+
         const secretAccessPolicyStatement = new PolicyStatement({
             actions: ['secretsmanager:GetSecretValue'],
             resources: [
@@ -189,8 +50,8 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
 
         const taskdef = {
             family: "api-blue-green-fargate-task-definition",
-            executionRoleArn: ecsRole.roleArn,
-            taskRoleArn: ecsRole.roleArn,
+            executionRoleArn: ecsRoleArnParameter.stringValue,
+            taskRoleArn: ecsRoleArnParameter.stringValue,
             containerDefinitions: [
                 {
                     name: "api-blue-green-container",
@@ -225,7 +86,7 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
                     TargetService: {
                         Type: "AWS::ECS::Service",
                         Properties: {
-                            TaskDefinition: taskDefinition.taskDefinitionArn,
+                            TaskDefinition: taskDefinitionParameter.stringValue,
                             LoadBalancerInfo: {
                                 ContainerName: "api-blue-green-container",
                                 ContainerPort: 80
@@ -305,6 +166,36 @@ export class GreenBlueFargateCodePipelineCdkStack extends Stack {
                 outputs: [buildStageOutput],
             })
         );
+
+        const blueTargetGroup = ApplicationTargetGroup.fromTargetGroupAttributes(this, 'BlueApplicationTargetGroup', {
+            targetGroupArn: blueTargetGroupArnParameter.stringValue
+        })
+
+        const greenTargetGroup = ApplicationTargetGroup.fromTargetGroupAttributes(this, 'GreenApplicationTargetGroup', {
+            targetGroupArn: greenTargetGroupArnParameter.stringValue
+        })
+
+        const securityGroup = SecurityGroup.fromSecurityGroupId(this, 'SecurityGroup', albSecurityGroupId.stringValue);
+
+        const listener = ApplicationListener.fromApplicationListenerAttributes(this, 'ApplicationListener', {
+            listenerArn: listenerArnParameter.stringValue,
+            securityGroup,
+            defaultPort: 80
+        })
+
+        const testListener = ApplicationListener.fromApplicationListenerAttributes(this, 'TestApplicationListener', {
+            listenerArn: testListenerArnParameter.stringValue,
+            securityGroup,
+            defaultPort: 8080
+        })
+
+        const cluster = Cluster.fromClusterArn(this, 'Cluster', ecsArnParameter.stringValue)
+
+        // Todo: see if this works without the cluster property that IBaseService has
+        const fargate = FargateService.fromFargateServiceAttributes(this, 'FargateService', {
+            serviceArn: fargateServiceParameter.stringValue,
+            cluster
+        })
 
         const ecsDeploymentGp = new EcsDeploymentGroup(this, `ApiBlueGreenEcsDeploymentGroup`, {
             deploymentGroupName: 'ApiBlueGreen',
