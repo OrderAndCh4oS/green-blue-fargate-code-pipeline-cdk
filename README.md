@@ -81,6 +81,11 @@ This project uses AWS CDK to define the infrastructure as code. It includes the 
 
 - **GreenBlueFargateCodePipelineCdkStack**: Sets up a CodePipeline to automate the deployment process.
 
+## Todo
+
+- Parameterise repo values
+- Pull build script in from other repo
+
 ## Contributing
 
 Contributions are welcome! If you find any issues or have improvements to suggest, please open an issue or a pull request.
